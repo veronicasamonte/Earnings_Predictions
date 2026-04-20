@@ -1,0 +1,557 @@
+
+
+import re
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy import sparse
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.compose import ColumnTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+warnings.filterwarnings("ignore")
+pd.set_option("display.max_columns", 200)
+pd.set_option("display.max_colwidth", 160)
+
+
+TRAIN_PATH = "hw_drift_train.csv"
+TEST_PATH = "hw_drift_test.csv"
+TEMPLATE_PATH = "Earnings_template.xlsx"
+OUTPUT_PATH = "submission_profit_model.xlsx"
+
+train = pd.read_csv(TRAIN_PATH)
+test = pd.read_csv(TEST_PATH)
+template = pd.read_excel(TEMPLATE_PATH)
+
+train["call_date"] = pd.to_datetime(train["call_date"])
+test["call_date"] = pd.to_datetime(test["call_date"])
+
+print("Train shape:", train.shape)
+print("Test shape:", test.shape)
+print("Template shape:", template.shape)
+print(train.columns.tolist())
+print(test.columns.tolist())
+
+
+def safe_to_float(x):
+    if x is None:
+        return np.nan
+    x = str(x).strip().replace(",", "").replace("%", "")
+    if x in {"", "-"}:
+        return np.nan
+    if x.upper() == "NM":
+        return np.nan
+    neg = x.startswith("(") and x.endswith(")")
+    x = x.strip("()")
+    try:
+        val = float(x)
+        return -val if neg else val
+    except:
+        return np.nan
+
+
+def extract_front_text(text, n_chars=2500):
+    text = "" if pd.isna(text) else str(text)
+    return text[:n_chars]
+
+
+def extract_back_text(text, n_chars=1800):
+    text = "" if pd.isna(text) else str(text)
+    return text[-n_chars:]
+
+
+def extract_presentation_text(text):
+    text = "" if pd.isna(text) else str(text)
+    lower = text.lower()
+    start = lower.find("presentation")
+    if start == -1:
+        return text[:4000]
+    return text[start:start+4000]
+
+
+def parse_surprise_features(text):
+    text = "" if pd.isna(text) else str(text)
+    front = text[:3000]
+
+    out = {
+        "eps_surprise": np.nan,
+        "rev_surprise": np.nan,
+        "has_nm": int("NM" in front),
+        "digit_count_front": sum(ch.isdigit() for ch in front),
+        "paren_count_front": front.count("("),
+        "front_len": len(front),
+    }
+
+    rev_match = re.search(
+        r"Revenue \(mm\)\s+([\(\)\-\d\.,]+)\s+([\(\)\-\d\.,]+)\s+([\(\)\-\d\.,NM%]+)",
+        front,
+        flags=re.IGNORECASE,
+    )
+    if rev_match:
+        out["rev_surprise"] = safe_to_float(rev_match.group(3))
+
+def parse_surprise_features(text):
+    text = "" if pd.isna(text) else str(text)
+    front = text[:3000]
+
+    out = {
+        "eps_surprise": np.nan,
+        "rev_surprise": np.nan,
+        "has_nm": int("NM" in front),
+        "digit_count_front": sum(ch.isdigit() for ch in front),
+        "paren_count_front": front.count("("),
+        "front_len": len(front),
+    }
+
+    rev_match = re.search(
+        r"Revenue \(mm\)\s+([\(\)\-\d\.,]+)\s+([\(\)\-\d\.,]+)\s+([\(\)\-\d\.,NM%]+)",
+        front,
+        flags=re.IGNORECASE,
+    )
+    if rev_match:
+        out["rev_surprise"] = safe_to_float(rev_match.group(3))
+
+    eps_zone = front.split("Revenue (mm)")[0]
+    eps_match = re.search(
+        r"EPS[^\n]{0,80}?([\(\)\-\d\.,]+)\s+([\(\)\-\d\.,]+)\s+([\(\)\-\d\.,NM%]+)",
+        eps_zone,
+        flags=re.IGNORECASE,
+    )
+    if eps_match:
+        out["eps_surprise"] = safe_to_float(eps_match.group(3))
+
+    out["abs_eps_surprise"] = np.abs(out["eps_surprise"]) if pd.notna(out["eps_surprise"]) else np.nan
+    out["abs_rev_surprise"] = np.abs(out["rev_surprise"]) if pd.notna(out["rev_surprise"]) else np.nan
+    out["eps_missing"] = int(pd.isna(out["eps_surprise"]))
+    out["rev_missing"] = int(pd.isna(out["rev_surprise"]))
+
+    return out
+
+
+def add_features(df):
+    df = df.copy()
+    df["front_text"] = df["transcript_text"].apply(extract_front_text)
+    df["back_text"] = df["transcript_text"].apply(extract_back_text)
+    df["presentation_text"] = df["transcript_text"].apply(extract_presentation_text)
+
+    parsed = df["transcript_text"].apply(parse_surprise_features).apply(pd.Series)
+    df = pd.concat([df, parsed], axis=1)
+
+    df["year"] = df["call_date"].dt.year
+    df["month"] = df["call_date"].dt.month
+    df["quarter_only"] = df["period"].astype(str).str.extract(r"(Q\d)")
+    df["company_period"] = df["company"].astype(str) + "__" + df["period"].astype(str)
+    return df
+
+
+train_feat = add_features(train)
+test_feat = add_features(test)
+
+train_feat[[
+    "company", "period", "call_date", "eps_surprise", "rev_surprise",
+    "has_nm", "front_len", "quarter_only"
+]].head()
+
+
+TARGET = "direction"
+RETURN_COL = "market_adj_return_pct"
+
+y = (train_feat[TARGET] == "UP").astype(int)
+returns = train_feat[RETURN_COL].values
+
+text_front_features = "front_text"
+text_presentation_features = "presentation_text"
+text_back_features = "back_text"
+
+numeric_features = [
+    "eps_surprise",
+    "rev_surprise",
+    "abs_eps_surprise",
+    "abs_rev_surprise",
+    "eps_missing",
+    "rev_missing",
+    "has_nm",
+    "digit_count_front",
+    "paren_count_front",
+    "front_len",
+    "year",
+    "month",
+]
+
+categorical_features = [
+    "quarter_only",
+]
+
+front_preprocessor = ColumnTransformer(
+    transformers=[
+        (
+            "front_word_tfidf",
+            TfidfVectorizer(
+                lowercase=True,
+                strip_accents="unicode",
+                ngram_range=(1, 2),
+                min_df=5,
+                max_df=0.98,
+                sublinear_tf=True,
+                max_features=25000,
+            ),
+            text_front_features,
+        ),
+        (
+            "front_char_tfidf",
+            TfidfVectorizer(
+                analyzer="char_wb",
+                ngram_range=(3, 5),
+                min_df=5,
+                max_df=0.995,
+                sublinear_tf=True,
+                max_features=12000,
+            ),
+            text_front_features,
+        ),
+        (
+            "num",
+            Pipeline([
+                ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+                ("scaler", StandardScaler(with_mean=False)),
+            ]),
+            numeric_features,
+        ),
+        (
+            "cat",
+            OneHotEncoder(handle_unknown="ignore"),
+            categorical_features,
+        ),
+    ],
+    remainder="drop",
+    sparse_threshold=1.0,
+)
+
+presentation_preprocessor = ColumnTransformer(
+    transformers=[
+        (
+            "presentation_tfidf",
+            TfidfVectorizer(
+                lowercase=True,
+                strip_accents="unicode",
+                ngram_range=(1, 2),
+                min_df=8,
+                max_df=0.99,
+                sublinear_tf=True,
+                max_features=12000,
+            ),
+            text_presentation_features,
+        ),
+    ],
+    remainder="drop",
+    sparse_threshold=1.0,
+)
+
+front_model = Pipeline([
+    ("prep", front_preprocessor),
+    ("clf", LogisticRegression(C=0.6, solver="liblinear", max_iter=2500)),
+])
+
+presentation_model = Pipeline([
+    ("prep", presentation_preprocessor),
+    ("clf", LogisticRegression(C=0.8, solver="liblinear", max_iter=2500)),
+])
+
+
+def get_year_splits(df, valid_years=(2018, 2019, 2020, 2021, 2022), min_train_rows=750):
+    splits = []
+    years = df["call_date"].dt.year
+    for year in valid_years:
+        train_idx = df.index[years < year].to_numpy()
+        valid_idx = df.index[years == year].to_numpy()
+        if len(train_idx) >= min_train_rows and len(valid_idx) > 0:
+            splits.append((year, train_idx, valid_idx))
+    return splits
+
+splits = get_year_splits(train_feat)
+[(year, len(tr), len(va)) for year, tr, va in splits]
+
+
+def build_investments_from_probs(
+    probs,
+    long_frac=0.07,
+    short_frac=0.02,
+    long_sizes=(2500, 6000, 12000),
+    short_sizes=(2500, 6000, 12000),
+):
+    probs = np.asarray(probs)
+    n = len(probs)
+    invest = np.zeros(n, dtype=float)
+
+    long_n = max(1, int(round(n * long_frac)))
+    short_n = max(1, int(round(n * short_frac)))
+
+    order = np.argsort(probs)
+    short_idx = order[:short_n]
+    long_idx = order[-long_n:]
+
+    def assign_tiered_sizes(indices, sizes, sign):
+        conf = np.abs(probs[indices] - 0.5)
+        ranked = indices[np.argsort(conf)]
+        k = len(ranked)
+        if k == 1:
+            invest[ranked[0]] = sign * sizes[-1]
+            return
+        for i, idx in enumerate(ranked):
+            frac = (i + 1) / k
+            if frac <= 1/3:
+                size = sizes[0]
+            elif frac <= 2/3:
+                size = sizes[1]
+            else:
+                size = sizes[2]
+            invest[idx] = sign * size
+
+    assign_tiered_sizes(long_idx, long_sizes, +1)
+    assign_tiered_sizes(short_idx, short_sizes, -1)
+    return invest
+
+
+def calc_profit(dollar_investment, market_adj_return_pct):
+    return float(np.sum(np.asarray(dollar_investment) * np.asarray(market_adj_return_pct) / 100.0))
+
+
+search_grid = [
+    {"blend_front": 0.75, "long_frac": 0.07, "short_frac": 0.02},
+    {"blend_front": 0.80, "long_frac": 0.07, "short_frac": 0.02},
+    {"blend_front": 0.80, "long_frac": 0.06, "short_frac": 0.03},
+]
+
+results = []
+
+for cfg in search_grid:
+    oof_probs = np.full(len(train_feat), np.nan)
+    fold_rows = []
+
+    for year, tr_idx, va_idx in splits:
+        X_tr = train_feat.iloc[tr_idx]
+        X_va = train_feat.iloc[va_idx]
+        y_tr = y.iloc[tr_idx]
+        y_va = y.iloc[va_idx]
+        r_va = returns[va_idx]
+
+        front_model.fit(X_tr, y_tr)
+        presentation_model.fit(X_tr, y_tr)
+
+        p_front = front_model.predict_proba(X_va)[:, 1]
+        p_pres = presentation_model.predict_proba(X_va)[:, 1]
+        p_blend = cfg["blend_front"] * p_front + (1 - cfg["blend_front"]) * p_pres
+
+        p_blend = 1 / (1 + np.exp(-4 * (p_blend - 0.5)))
+        oof_probs[va_idx] = p_blend
+
+        auc = roc_auc_score(y_va, p_blend)
+        auc = max(auc, 1 - auc)
+
+        invest = build_investments_from_probs(
+            p_blend,
+            long_frac=cfg["long_frac"],
+            short_frac=cfg["short_frac"],
+        )
+
+        profit = calc_profit(invest, r_va)
+
+        fold_rows.append({
+            "year": year,
+            "auc": auc,
+            "profit": profit,
+            "n_valid": len(va_idx),
+        })
+
+    fold_df = pd.DataFrame(fold_rows)
+
+    results.append({
+        **cfg,
+        "mean_auc": fold_df["auc"].mean(),
+        "mean_profit": fold_df["profit"].mean(),
+        "total_profit": fold_df["profit"].sum(),
+    })
+
+
+summary = pd.DataFrame(results)
+summary = summary.sort_values(["total_profit", "mean_auc"], ascending=False)
+
+print("\n=== VALIDATION SUMMARY ===")
+print(summary)
+
+best_row = summary.iloc[0].to_dict()
+print("\nBest config:", best_row)
+
+
+print("\n=== TRAINING PROFIT CHECK ===")
+
+front_model.fit(train_feat, y)
+presentation_model.fit(train_feat, y)
+
+train_p_front = front_model.predict_proba(train_feat)[:, 1]
+train_p_pres = presentation_model.predict_proba(train_feat)[:, 1]
+
+train_prob = best_row["blend_front"] * train_p_front + (1 - best_row["blend_front"]) * train_p_pres
+
+train_invest = build_investments_from_probs(
+    train_prob,
+    long_frac=best_row["long_frac"],
+    short_frac=best_row["short_frac"],
+)
+
+train_profit = calc_profit(train_invest, returns)
+
+print(f"Training Profit: {train_profit:,.2f}")
+
+print("\nInvestment summary:")
+print(pd.Series(train_invest).describe())
+
+best_row = sorted(results, key=lambda d: (d["total_profit"], d["mean_auc"]), reverse=True)[0]
+print("Best config:")
+print({k: v for k, v in best_row.items() if k != "folds"})
+
+BEST_BLEND_FRONT = best_row["blend_front"]
+BEST_LONG_FRAC = best_row["long_frac"]
+BEST_SHORT_FRAC = best_row["short_frac"]
+
+front_model.fit(train_feat, y)
+presentation_model.fit(train_feat, y)
+
+test_p_front = front_model.predict_proba(test_feat)[:, 1]
+test_p_pres = presentation_model.predict_proba(test_feat)[:, 1]
+test_prob_up = BEST_BLEND_FRONT * test_p_front + (1 - BEST_BLEND_FRONT) * test_p_pres
+
+test_prob_up = 1 / (1 + np.exp(-4 * (test_prob_up - 0.5)))
+
+test_prob_up = np.clip(test_prob_up, 0.02, 0.98)
+
+test_invest = build_investments_from_probs(
+    test_prob_up,
+    long_frac=BEST_LONG_FRAC,
+    short_frac=BEST_SHORT_FRAC,
+)
+
+submission = template.copy()
+
+prob_col = None
+inv_col = None
+for col in submission.columns:
+    c = col.lower().strip()
+    if c == "probabilityup":
+        prob_col = col
+    if c == "dollarinvestment":
+        inv_col = col
+
+if prob_col is None:
+    submission["ProbabilityUp"] = test_prob_up
+    prob_col = "ProbabilityUp"
+else:
+    submission[prob_col] = test_prob_up
+
+if inv_col is None:
+    submission["DollarInvestment"] = test_invest
+    inv_col = "DollarInvestment"
+else:
+    submission[inv_col] = test_invest
+
+submission.head()
+
+print("\n=== TRAINING PROFIT CHECK ===")
+
+front_model.fit(train_feat, y)
+presentation_model.fit(train_feat, y)
+
+train_p_front = front_model.predict_proba(train_feat)[:, 1]
+train_p_pres = presentation_model.predict_proba(train_feat)[:, 1]
+
+train_prob = best_row["blend_front"] * train_p_front + (1 - best_row["blend_front"]) * train_p_pres
+
+train_invest = build_investments_from_probs(
+    train_prob,
+    long_frac=best_row["long_frac"],
+    short_frac=best_row["short_frac"],
+)
+
+train_profit = calc_profit(train_invest, returns)
+
+print(f"Training Profit: {train_profit:,.2f}")
+print(f"Mean prob: {train_prob.mean():.4f}")
+print(f"Min prob: {train_prob.min():.4f}")
+print(f"Max prob: {train_prob.max():.4f}")
+print(f"Nonzero investments: {(train_invest != 0).sum()} out of {len(train_invest)}")
+
+print("\nInvestment value counts:")
+print(pd.Series(train_invest).value_counts().sort_index())
+
+candidate_rules = [
+    (0.02, 0.01),
+    (0.03, 0.01),
+    (0.03, 0.015),
+    (0.04, 0.02),
+    (0.05, 0.02),
+    (0.06, 0.03),
+]
+
+print("\n=== TRAINING RULE CHECK ===")
+for long_frac, short_frac in candidate_rules:
+    invest = build_investments_from_probs(
+        train_prob,
+        long_frac=long_frac,
+        short_frac=short_frac,
+    )
+    profit = calc_profit(invest, returns)
+    n_trades = (invest != 0).sum()
+    print(f"long={long_frac:.3f} short={short_frac:.3f} | profit={profit:,.2f} | trades={n_trades}")
+
+submission.to_excel(OUTPUT_PATH, index=False)
+print(f"Saved submission to: {OUTPUT_PATH}")
+print(submission[[prob_col, inv_col]].describe())
+
+feature_check = train_feat[[
+    "company", "period", "call_date", "eps_surprise", "rev_surprise",
+    "abs_eps_surprise", "abs_rev_surprise", "has_nm", "digit_count_front"
+]].copy()
+feature_check.head(10)
+
+def compute_profit(y_true_return, probs, long_pct=0.02, short_pct=0.01):
+    """
+    y_true_return: actual market_adj_return_pct
+    probs: predicted ProbabilityUp
+    """
+
+    df = pd.DataFrame({
+        "ret": y_true_return,
+        "prob": probs
+    }).copy()
+
+    df["edge"] = df["prob"] - 0.5
+    df["abs_edge"] = np.abs(df["edge"])
+
+    df = df.sort_values("abs_edge", ascending=False)
+
+    n = len(df)
+    n_long = int(n * long_pct)
+    n_short = int(n * short_pct)
+
+    df["position"] = 0
+
+    df.loc[df.nlargest(n_long, "prob").index, "position"] = 1
+
+    df.loc[df.nsmallest(n_short, "prob").index, "position"] = -1
+
+    df["size"] = df["abs_edge"] / df["abs_edge"].max()
+    df["size"] = df["size"].fillna(0)
+
+    df["dollar"] = df["position"] * df["size"] * 1000
+
+
+    df["profit"] = df["dollar"] * df["ret"]
+
+    return df["profit"].sum(), df

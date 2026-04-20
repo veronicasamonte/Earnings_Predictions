@@ -19,10 +19,10 @@ pd.set_option("display.max_columns", 200)
 pd.set_option("display.max_colwidth", 160)
 
 
-TRAIN_PATH = "hw_drift_train.csv"
-TEST_PATH = "hw_drift_test.csv"
+TRAIN_PATH = "drift_train.csv"
+TEST_PATH = "drift_test.csv"
 TEMPLATE_PATH = "Earnings_template.xlsx"
-OUTPUT_PATH = "submission_profit_model.xlsx"
+OUTPUT_PATH = "profit_model.xlsx"
 
 train = pd.read_csv(TRAIN_PATH)
 test = pd.read_csv(TEST_PATH)
